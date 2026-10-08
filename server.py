@@ -1,10 +1,12 @@
 """Sinhala TTS annotation tool - local web server (Python standard library only).
 
 Usage:
-    python server.py [--data DATA_DIR] [--port 8000]
+    python server.py [--data DATA_DIR] [--out OUT_DIR] [--port 8000]
 
 Any folder under DATA_DIR that contains a `metadata.csv` and a `clips/` folder
-is treated as a dataset. Annotations are written back into that metadata.csv.
+is treated as a dataset. DATA_DIR is never modified: annotations are written to
+OUT_DIR/<dataset path>/metadata.csv, which starts as a copy of the original
+CSV and is read back on later runs so work continues where it left off.
 """
 
 import argparse
@@ -12,7 +14,6 @@ import csv
 import json
 import mimetypes
 import os
-import shutil
 import threading
 import urllib.parse
 import wave
@@ -26,7 +27,6 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
 METADATA_NAME = "metadata.csv"
-BACKUP_NAME = "metadata.backup.csv"
 CLIPS_DIR = "clips"
 RAW_DIR = "raw_audio"
 
@@ -44,6 +44,7 @@ AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
 write_lock = threading.Lock()
 DATA_ROOT: Path = APP_DIR / "data"
+OUT_ROOT: Path = APP_DIR / "annotations"
 
 
 # --------------------------------------------------------------------------- datasets
@@ -68,18 +69,25 @@ def dataset_dir(ds_id):
     return folder
 
 
+def output_csv(folder):
+    """Where annotations for a dataset folder are saved (mirrors its path under DATA_ROOT)."""
+    return OUT_ROOT / folder.relative_to(DATA_ROOT) / METADATA_NAME
+
+
 def read_csv(folder):
-    with open(folder / METADATA_NAME, encoding="utf-8-sig", newline="") as f:
+    """Read the annotated CSV if one exists, otherwise the original (read-only) one."""
+    path = output_csv(folder)
+    if not path.is_file():
+        path = folder / METADATA_NAME
+    with open(path, encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         return list(reader.fieldnames or []), list(reader)
 
 
 def write_csv(folder, columns, rows):
-    """Atomically rewrite metadata.csv, keeping a one-time backup of the original."""
-    target = folder / METADATA_NAME
-    backup = folder / BACKUP_NAME
-    if not backup.exists():
-        shutil.copy2(target, backup)
+    """Atomically write the annotated CSV to OUT_ROOT; the dataset folder is never touched."""
+    target = output_csv(folder)
+    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".csv.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns, lineterminator="\n", extrasaction="ignore")
@@ -150,6 +158,7 @@ def dataset_detail(ds_id):
         "rows": rows,
         "unlisted": [c for c in clip_files if c not in listed],
         "raw_audio": first_audio(folder / RAW_DIR),
+        "output": str(output_csv(folder)),
     }
 
 
@@ -305,16 +314,21 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global DATA_ROOT
+    global DATA_ROOT, OUT_ROOT
     parser = argparse.ArgumentParser(description="Sinhala TTS clip annotation tool")
-    parser.add_argument("--data", default=str(APP_DIR / "data"), help="root folder containing datasets")
+    parser.add_argument("--data", default=str(APP_DIR / "data"), help="root folder containing datasets (read-only)")
+    parser.add_argument("--out", default=str(APP_DIR / "annotations"), help="where annotated metadata.csv files are saved")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     args = parser.parse_args()
 
     DATA_ROOT = Path(args.data).resolve()
+    OUT_ROOT = Path(args.out).resolve()
+    if OUT_ROOT == DATA_ROOT or DATA_ROOT in OUT_ROOT.parents:
+        parser.error("--out must not be inside --data (the data folder is kept read-only)")
     datasets = find_datasets()
-    print(f"Data root: {DATA_ROOT}")
+    print(f"Data root (read-only): {DATA_ROOT}")
+    print(f"Annotations saved to:  {OUT_ROOT}")
     print(f"Found {len(datasets)} dataset(s):")
     for d in datasets:
         print(f"  - {d}")

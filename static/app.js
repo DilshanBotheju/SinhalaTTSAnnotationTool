@@ -109,6 +109,8 @@ async function loadDataset(id) {
   if (state.ds.raw_audio) rawAudio.src = audioUrl("raw_audio", state.ds.raw_audio);
 
   render();
+  setSaveState("Saves to annotations/");
+  $("save-state").title = `Annotations are saved to ${state.ds.output}`;
   const lastClip = recall(`clip:${id}`);
   const first = state.items.find((i) => i.clip === lastClip)
     || state.items.find((i) => statusOf(i) === "pending")

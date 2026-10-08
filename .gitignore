@@ -1,5 +1,7 @@
 # Dataset audio + metadata are large and live outside version control
 data/
+# Annotation output (annotated metadata.csv files) is not tracked
+annotations/
 
 # Python
 __pycache__/
