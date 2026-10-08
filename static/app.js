@@ -73,7 +73,7 @@ function clipUrl(clip) {
 }
 
 function clipNumber(name) {
-  const m = name.match(/_(\d+)\.\w+$/);
+  const m = name.match(/_(\d+[a-z]?)\.\w+$/);
   return m ? m[1] : "";
 }
 
@@ -253,11 +253,16 @@ function renderPanel() {
   meta.appendChild(actual);
   if (row && row.annotated_at) addMeta("last saved", row.annotated_at.replace("T", " "));
   if (row && row.clip_edited === "yes") addMeta("clip", "re-cut");
+  const created = !!(row && row.created_from);
+  if (created) addMeta("created from", `#${clipNumber(row.created_from)}`);
 
   $("unlisted-box").hidden = item.kind !== "unlisted";
   $("trim").hidden = item.kind === "unlisted";
-  $("trim-edited").hidden = !(row && row.clip_edited === "yes");
+  $("trim-edited").hidden = !(row && row.clip_edited);
+  $("trim-edited").textContent = created ? "created" : "edited";
+  $("trim-revert").hidden = created;
   $("trim-revert").disabled = !(row && row.clip_edited === "yes");
+  $("trim-delete").hidden = !created;
   $("fields").hidden = item.kind === "unlisted";
   $("btn-context").disabled = !state.ds.raw_audio || !row || row.start_sec === "";
 
@@ -471,6 +476,7 @@ function updateTrimInputs() {
   $("trim-len").textContent = `length ${(e - s).toFixed(2)}s (was ${was.toFixed(2)}s)` +
     (changed ? ` · start ${fmt(ds)} · end ${fmt(de)}` : "");
   $("trim-save").disabled = !changed;
+  $("trim-new").disabled = !changed;
   drawTrim();
 }
 
@@ -575,6 +581,51 @@ async function revertTrim() {
   await applyClipChange("/api/revert_clip", { clip_filename: item.clip }, "Reverted to original clip");
 }
 
+async function newClipFromSelection() {
+  const item = currentItem();
+  if (!item || !trim.info) return;
+  if (state.dirty && !(await saveFields())) return;
+  stopAll();
+  setSaveState("Saving…");
+  try {
+    const row = await api(`/api/new_clip?id=${encodeURIComponent(state.ds.id)}`, {
+      clip_filename: item.clip,
+      start_sec: trim.sel[0],
+      end_sec: trim.sel[1],
+    });
+    row._has_audio = true;
+    state.ds.rows.push(row);
+    rebuildItems();
+    render();
+    await select(row.clip_filename);
+    setSaveState(`Created clip #${clipNumber(row.clip_filename)}`);
+    $("f-sinhala").focus();
+  } catch (e) {
+    setSaveState(`Create failed: ${e.message}`, true);
+  }
+}
+
+async function deleteCreatedClip() {
+  const item = currentItem();
+  if (!item || !item.row?.created_from) return;
+  if (!confirm(`Delete clip #${clipNumber(item.clip)} and its row from the annotated CSV?`)) return;
+  stopAll();
+  const next = neighbour(1) || neighbour(-1);
+  try {
+    await api(`/api/delete_clip?id=${encodeURIComponent(state.ds.id)}`, { clip_filename: item.clip });
+    state.ds.rows = state.ds.rows.filter((r) => r.clip_filename !== item.clip);
+    state.dirty = false;
+    rebuildItems();
+    render();
+    state.current = null;
+    if (next) await select(next);
+    else renderPanel();
+    setSaveState(`Deleted clip #${clipNumber(item.clip)}`);
+  } catch (e) {
+    setSaveState(`Delete failed: ${e.message}`, true);
+  }
+}
+
 async function applyClipChange(path, body, message) {
   setSaveState("Saving…");
   try {
@@ -616,6 +667,8 @@ $("trim-reset").onclick = () => {
 };
 $("trim-save").onclick = saveTrim;
 $("trim-revert").onclick = revertTrim;
+$("trim-new").onclick = newClipFromSelection;
+$("trim-delete").onclick = deleteCreatedClip;
 $("trim").addEventListener("toggle", () => {
   store("trimOpen", $("trim").open ? "1" : "0");
   loadSegment();

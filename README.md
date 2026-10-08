@@ -55,7 +55,8 @@ The annotated CSV keeps every original column and adds:
 | `annotation_status` | `pending`, `approved`, `rejected`, `needs_review` |
 | `annotation_notes` | free text from the annotator |
 | `annotated_at` | timestamp of the last save for that row |
-| `clip_edited` | `yes` if the clip was re-cut with the trim tool |
+| `clip_edited` | `yes` if the clip was re-cut with the trim tool, `new` if the clip was created in the tool |
+| `created_from` | for created clips: the original clip they were cut from |
 
 `transcript_sinhala`, `transcript_romanized` and `annotation_notes` are edited directly. `start_sec`, `end_sec` and `duration_sec` change only through the trim tool (below).
 
@@ -65,13 +66,25 @@ Open **✂ Trim / extend clip** under the player (or press `Alt+T`). It shows th
 
 - drag the handles, click to move the nearest handle, or type start/end times,
 - **Play selection** to check the new boundaries,
-- **Save new clip** to cut it.
+- **Re-cut this clip** to replace the clip with the selection, or
+- **+ Save selection as new clip** to keep the clip as it is and create a new clip with its own CSV row.
 
-Saving cuts the new clip from `raw_audio/` (sample-exact) and writes it to `annotations/<dataset>/clips/<same filename>`. It also updates `start_sec`, `end_sec`, `duration_sec` and `clip_edited` in the annotated CSV. The original clip in `data/` is untouched, and **Revert to original** deletes the re-cut file and restores the original timings.
+Re-cutting cuts the new clip from `raw_audio/` (sample-exact) and writes it to `annotations/<dataset>/clips/<same filename>`. It also updates `start_sec`, `end_sec`, `duration_sec` and `clip_edited` in the annotated CSV. The original clip in `data/` is untouched, and **Revert to original** deletes the re-cut file and restores the original timings.
 
 If a row has no `start_sec`/`end_sec` (e.g. a clip added from **Not in CSV**) or there's no raw `.wav`, the clip can only be trimmed, not extended.
 
-When using the annotated dataset, take each clip from `annotations/<dataset>/clips/` when `clip_edited` is `yes`, otherwise from `data/<dataset>/clips/`.
+### Creating new clips
+
+**+ Save selection as new clip** is for clips that hold more than one utterance, or when a missed bit of speech sits in the context around a clip:
+
+- The new clip is named after the original with a letter suffix: `…_0001b.wav`, `…_0001c.wav`, … so it sorts right after it.
+- It is saved to `annotations/<dataset>/clips/`.
+- Its new row copies `source_file` and gets the new timings, empty transcripts, status `pending`, `clip_edited = new` and `created_from = <original clip>`.
+- The original clip and its row are not changed. Re-cut the original afterwards if the two shouldn't overlap.
+
+Created clips can be re-cut like any other, and **Delete this clip** removes the clip and its row. Only clips created in the tool can be deleted.
+
+When using the annotated dataset, take each clip from `annotations/<dataset>/clips/` when `clip_edited` is `yes` or `new`, otherwise from `data/<dataset>/clips/`.
 
 ## Annotating
 

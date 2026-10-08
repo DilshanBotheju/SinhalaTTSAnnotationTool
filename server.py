@@ -16,6 +16,7 @@ import io
 import json
 import mimetypes
 import os
+import string
 import threading
 import urllib.parse
 import wave
@@ -36,8 +37,9 @@ RAW_DIR = "raw_audio"
 STATUS_COL = "annotation_status"
 NOTES_COL = "annotation_notes"
 TIME_COL = "annotated_at"
-EDITED_COL = "clip_edited"
-ANNOTATION_COLS = [STATUS_COL, NOTES_COL, TIME_COL, EDITED_COL]
+EDITED_COL = "clip_edited"      # "yes" = re-cut original clip, "new" = clip created in the tool
+CREATED_COL = "created_from"    # for created clips: the original dataset clip they were cut from
+ANNOTATION_COLS = [STATUS_COL, NOTES_COL, TIME_COL, EDITED_COL, CREATED_COL]
 STATUSES = {"pending", "approved", "rejected", "needs_review"}
 
 # Clip boundary editing: context shown either side of a clip, and shortest allowed clip.
@@ -131,10 +133,17 @@ def first_audio(folder):
     return None
 
 
+def audio_names(directory):
+    if not directory.is_dir():
+        return set()
+    return {p.name for p in directory.iterdir() if p.suffix.lower() in AUDIO_EXTS}
+
+
 def dataset_summary(ds_id):
     folder = dataset_dir(ds_id)
     columns, rows = read_csv(folder)
-    clips = {p.name for p in (folder / CLIPS_DIR).iterdir() if p.suffix.lower() in AUDIO_EXTS}
+    clips = audio_names(folder / CLIPS_DIR)
+    playable = clips | audio_names(edited_clips_dir(folder))
     counts = {s: 0 for s in STATUSES}
     for r in rows:
         counts[r.get(STATUS_COL) or "pending"] = counts.get(r.get(STATUS_COL) or "pending", 0) + 1
@@ -144,7 +153,7 @@ def dataset_summary(ds_id):
         "rows": len(rows),
         "clips": len(clips),
         "unlisted": len(clips - listed),
-        "missing_audio": len(listed - clips),
+        "missing_audio": len(listed - playable),
         "counts": counts,
     }
 
@@ -152,12 +161,13 @@ def dataset_summary(ds_id):
 def dataset_detail(ds_id):
     folder = dataset_dir(ds_id)
     columns, rows = read_csv(folder)
-    clip_files = sorted(p.name for p in (folder / CLIPS_DIR).iterdir() if p.suffix.lower() in AUDIO_EXTS)
-    clip_set = set(clip_files)
+    clip_files = sorted(audio_names(folder / CLIPS_DIR))
+    # Clips created by the tool live only under OUT_ROOT, so count those as having audio too.
+    playable = set(clip_files) | audio_names(edited_clips_dir(folder))
     listed = {r["clip_filename"] for r in rows}
     for r in rows:
         r.setdefault(STATUS_COL, "")
-        r["_has_audio"] = r["clip_filename"] in clip_set
+        r["_has_audio"] = r["clip_filename"] in playable
     return {
         "id": ds_id,
         "columns": columns,
@@ -229,9 +239,13 @@ def check_name(name):
     return name
 
 
+def edited_clips_dir(folder):
+    """Where re-cut and newly created clips are saved (mirrors the dataset's clips/ under OUT_ROOT)."""
+    return OUT_ROOT / folder.relative_to(DATA_ROOT) / CLIPS_DIR
+
+
 def edited_clip_path(folder, clip):
-    """Where a re-cut clip is saved (mirrors the dataset's clips/ folder under OUT_ROOT)."""
-    return OUT_ROOT / folder.relative_to(DATA_ROOT) / CLIPS_DIR / clip
+    return edited_clips_dir(folder) / clip
 
 
 def clip_path(folder, clip):
@@ -322,48 +336,127 @@ def clip_segment(ds_id, clip):
     return wav_bytes(params, frames), info
 
 
-def crop_clip(ds_id, payload):
-    """Re-cut a clip to new boundaries and save it under OUT_ROOT; update its CSV row."""
-    clip = check_name(payload.get("clip_filename"))
+def parse_bounds(payload):
     start, end = to_float(payload.get("start_sec")), to_float(payload.get("end_sec"))
     if start is None or end is None:
         raise ValueError("start_sec and end_sec are required")
     if end - start < MIN_CLIP_SEC:
         raise ValueError(f"clip must be at least {MIN_CLIP_SEC}s long")
+    return start, end
 
+
+def cut_audio(folder, row, start, end):
+    """Cut [start, end] from the row's edit source (see edit_source).
+
+    Returns (wav bytes, new timing columns).
+    """
+    mode, source = edit_source(folder, row)
+    params, frames, actual_start, total = read_wav_range(source, start, end)
+    if start < 0 or end > total + 0.01:
+        raise ValueError(f"boundaries must be within 0–{total:.2f}s")
+
+    duration = frames_duration(params, frames)
+    timings = {"duration_sec": round(duration, 2)}
+    if mode == "raw":
+        timings["start_sec"] = round(actual_start, 2)
+        timings["end_sec"] = round(actual_start + duration, 2)
+    else:
+        # Cutting inside the clip: shift the recorded timings if there are any.
+        old_start = to_float(row.get("start_sec"))
+        if old_start is not None:
+            timings["start_sec"] = round(old_start + actual_start, 2)
+            timings["end_sec"] = round(old_start + actual_start + duration, 2)
+    return wav_bytes(params, frames), timings
+
+
+def save_wav(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".wav.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def apply_timings(columns, row, timings):
+    for col, value in timings.items():
+        if col in columns:
+            row[col] = value
+
+
+def crop_clip(ds_id, payload):
+    """Re-cut a clip to new boundaries and save it under OUT_ROOT; update its CSV row."""
+    clip = check_name(payload.get("clip_filename"))
+    start, end = parse_bounds(payload)
     folder = dataset_dir(ds_id)
     with write_lock:
         columns, rows = read_csv(folder)
         ensure_annotation_cols(columns, rows)
         row = find_row(rows, clip)
-        mode, source = edit_source(folder, row)
-        params, frames, actual_start, total = read_wav_range(source, start, end)
-        if start < 0 or end > total + 0.01:
-            raise ValueError(f"boundaries must be within 0–{total:.2f}s")
-
-        duration = frames_duration(params, frames)
-        if mode == "raw":
-            row["start_sec"] = round(actual_start, 2)
-            row["end_sec"] = round(actual_start + duration, 2)
-        else:
-            # Trimming inside the clip: shift the recorded timings if there are any.
-            old_start = to_float(row.get("start_sec"))
-            if old_start is not None:
-                row["start_sec"] = round(old_start + actual_start, 2)
-                row["end_sec"] = round(old_start + actual_start + duration, 2)
-        if "duration_sec" in columns:
-            row["duration_sec"] = round(duration, 2)
-
-        target = edited_clip_path(folder, clip)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".wav.tmp")
-        tmp.write_bytes(wav_bytes(params, frames))
-        os.replace(tmp, target)
-
-        row[EDITED_COL] = "yes"
+        data, timings = cut_audio(folder, row, start, end)
+        save_wav(edited_clip_path(folder, clip), data)
+        apply_timings(columns, row, timings)
+        row[EDITED_COL] = "new" if row.get(CREATED_COL) else "yes"
         row[TIME_COL] = datetime.now().isoformat(timespec="seconds")
         write_csv(folder, columns, rows)
     return row
+
+
+def new_clip_name(folder, rows, root):
+    """Next free name derived from `root`: <stem>b.wav, <stem>c.wav, ... (sorts right after root)."""
+    stem, ext = os.path.splitext(root)
+    taken = ({r["clip_filename"] for r in rows}
+             | audio_names(folder / CLIPS_DIR)
+             | audio_names(edited_clips_dir(folder)))
+    for letter in string.ascii_lowercase[1:]:
+        name = f"{stem}{letter}{ext}"
+        if name not in taken:
+            return name
+    raise ValueError(f"too many clips created from {root}")
+
+
+def create_clip(ds_id, payload):
+    """Cut a selection out of an existing clip's audio into a new clip with its own CSV row."""
+    parent_name = check_name(payload.get("clip_filename"))
+    start, end = parse_bounds(payload)
+    folder = dataset_dir(ds_id)
+    with write_lock:
+        columns, rows = read_csv(folder)
+        ensure_annotation_cols(columns, rows)
+        parent = find_row(rows, parent_name)
+        data, timings = cut_audio(folder, parent, start, end)
+
+        # Name new clips after the original dataset clip, even when cut from a created one.
+        root = parent.get(CREATED_COL) or parent_name
+        name = new_clip_name(folder, rows, root)
+        save_wav(edited_clip_path(folder, name), data)
+
+        new = {c: "" for c in columns}
+        new["clip_filename"] = name
+        if "source_file" in columns:
+            new["source_file"] = parent.get("source_file", "")
+        apply_timings(columns, new, timings)
+        new[STATUS_COL] = "pending"
+        new[CREATED_COL] = root
+        new[EDITED_COL] = "new"
+        new[TIME_COL] = datetime.now().isoformat(timespec="seconds")
+        rows.append(new)
+        rows.sort(key=lambda r: r["clip_filename"])
+        write_csv(folder, columns, rows)
+    return new
+
+
+def delete_clip(ds_id, payload):
+    """Delete a clip the tool created (its wav and its CSV row). Original rows can't be deleted."""
+    clip = check_name(payload.get("clip_filename"))
+    folder = dataset_dir(ds_id)
+    with write_lock:
+        columns, rows = read_csv(folder)
+        row = find_row(rows, clip)
+        if not row.get(CREATED_COL):
+            raise ValueError("only clips created in this tool can be deleted")
+        edited_clip_path(folder, clip).unlink(missing_ok=True)
+        rows.remove(row)
+        write_csv(folder, columns, rows)
+    return {"deleted": clip}
 
 
 def revert_clip(ds_id, payload):
@@ -374,6 +467,8 @@ def revert_clip(ds_id, payload):
         columns, rows = read_csv(folder)
         ensure_annotation_cols(columns, rows)
         row = find_row(rows, clip)
+        if row.get(CREATED_COL):
+            raise ValueError("a created clip has no original to revert to; delete it instead")
         edited_clip_path(folder, clip).unlink(missing_ok=True)
 
         with open(folder / METADATA_NAME, encoding="utf-8-sig", newline="") as f:
@@ -444,6 +539,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(crop_clip(ds_id, payload))
             if url.path == "/api/revert_clip":
                 return self.send_json(revert_clip(ds_id, payload))
+            if url.path == "/api/new_clip":
+                return self.send_json(create_clip(ds_id, payload))
+            if url.path == "/api/delete_clip":
+                return self.send_json(delete_clip(ds_id, payload))
         except (KeyError, ValueError, wave.Error, json.JSONDecodeError) as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         except OSError as e:
