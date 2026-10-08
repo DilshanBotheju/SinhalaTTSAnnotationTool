@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sinhala TTS Annotator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Sinhala:wght@400;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Sinhala TTS Annotator</div>
+    <label class="dataset-picker">
+      <span>Dataset</span>
+      <select id="dataset"></select>
+    </label>
+    <div class="progress" title="Reviewed / total rows in metadata.csv">
+      <div class="progress-bar"><div id="progress-fill"></div></div>
+      <span id="progress-text">–</span>
+    </div>
+    <span id="save-state" class="save-state"></span>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="filters" id="filters"></div>
+      <input id="search" type="search" placeholder="Search filename or transcript…">
+      <ul id="clip-list" class="clip-list"></ul>
+    </aside>
+
+    <main class="editor" id="editor">
+      <div class="empty" id="empty">Select a clip to start annotating.</div>
+
+      <section id="panel" hidden>
+        <div class="clip-head">
+          <div>
+            <div class="clip-index" id="clip-index"></div>
+            <div class="clip-name" id="clip-name"></div>
+          </div>
+          <span class="badge" id="clip-status"></span>
+        </div>
+
+        <div class="meta" id="meta"></div>
+        <div class="warnings" id="warnings"></div>
+
+        <div class="player">
+          <canvas id="wave" height="110"></canvas>
+          <div class="controls">
+            <button id="btn-play" class="primary" title="Alt+P (or Space outside text boxes)">▶ Play</button>
+            <button id="btn-context" title="Alt+C — play this segment from raw_audio with 2 s either side">Play in context</button>
+            <label>Speed
+              <select id="speed">
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+              </select>
+            </label>
+            <label class="check"><input type="checkbox" id="autoplay"> Autoplay</label>
+            <span class="time" id="time">0.00 / 0.00 s</span>
+          </div>
+          <audio id="audio" preload="auto"></audio>
+          <audio id="raw-audio" preload="none"></audio>
+        </div>
+
+        <div id="unlisted-box" class="unlisted-box" hidden>
+          <p>This clip exists in <code>clips/</code> but has <b>no row in metadata.csv</b>.
+             Listen to it, then add it to the metadata to transcribe it.</p>
+          <button id="btn-add" class="primary">Add row to metadata.csv</button>
+        </div>
+
+        <div id="fields">
+          <label class="field">
+            <span>transcript_sinhala</span>
+            <textarea id="f-sinhala" class="sinhala" rows="3" data-col="transcript_sinhala"></textarea>
+          </label>
+          <label class="field">
+            <span>transcript_romanized</span>
+            <textarea id="f-roman" rows="2" data-col="transcript_romanized"></textarea>
+          </label>
+          <label class="field">
+            <span>annotation_notes</span>
+            <input id="f-notes" type="text" data-col="annotation_notes" placeholder="Optional: what was wrong / fixed">
+          </label>
+
+          <div class="actions">
+            <button id="btn-prev" title="Alt+B">← Prev</button>
+            <button id="btn-save" title="Alt+S — save edits without changing status">Save</button>
+            <span class="spacer"></span>
+            <button id="btn-reject" class="reject" title="Alt+R">✕ Reject</button>
+            <button id="btn-flag" class="flag" title="Alt+F">⚑ Needs review</button>
+            <button id="btn-approve" class="approve" title="Alt+A or Ctrl+Enter">✓ Approve</button>
+            <button id="btn-next" title="Alt+N">Next →</button>
+          </div>
+        </div>
+
+        <details class="help">
+          <summary>Keyboard shortcuts</summary>
+          <table>
+            <tr><td>Alt+P / Space</td><td>Play / pause clip (Space only outside text boxes)</td></tr>
+            <tr><td>Alt+C</td><td>Play segment in raw-audio context</td></tr>
+            <tr><td>Alt+A, Ctrl+Enter</td><td>Approve &amp; next</td></tr>
+            <tr><td>Alt+F</td><td>Needs review &amp; next</td></tr>
+            <tr><td>Alt+R</td><td>Reject &amp; next</td></tr>
+            <tr><td>Alt+S</td><td>Save edits</td></tr>
+            <tr><td>Alt+N / Alt+B</td><td>Next / previous clip (edits auto-save)</td></tr>
+          </table>
+        </details>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
