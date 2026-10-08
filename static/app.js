@@ -23,7 +23,24 @@ const state = {
   current: null,     // clip filename
   dirty: false,
   loadToken: 0,
+  clipVersion: {},   // clip -> counter, bumped when a clip is re-cut so audio reloads
 };
+
+// Boundary editor state. Times are on the segment's own timeline (see /api/segment).
+const trim = {
+  buf: null,         // decoded AudioBuffer of the segment (clip + context)
+  info: null,        // {mode, segment_start, source_duration, sel_start, sel_end}
+  peaks: null,
+  sel: [0, 0],       // current handle positions
+  drag: null,        // 0 = start handle, 1 = end handle
+  source: null,      // playing AudioBufferSourceNode
+  playStart: 0,      // audioCtx time when playback began
+  playFrom: 0,
+  rate: 1,
+  token: 0,
+};
+const MIN_CLIP_SEC = 0.2;
+const HANDLE_GRAB_PX = 10;
 
 const audio = $("audio");
 const rawAudio = $("raw-audio");
@@ -49,6 +66,10 @@ async function api(path, body) {
 function audioUrl(kind, file) {
   const q = new URLSearchParams({ id: state.ds.id, kind, file });
   return `/audio?${q}`;
+}
+
+function clipUrl(clip) {
+  return `${audioUrl("clips", clip)}&v=${state.clipVersion[clip] || 0}`;
 }
 
 function clipNumber(name) {
@@ -231,8 +252,12 @@ function renderPanel() {
   actual.id = "actual-duration";
   meta.appendChild(actual);
   if (row && row.annotated_at) addMeta("last saved", row.annotated_at.replace("T", " "));
+  if (row && row.clip_edited === "yes") addMeta("clip", "re-cut");
 
   $("unlisted-box").hidden = item.kind !== "unlisted";
+  $("trim").hidden = item.kind === "unlisted";
+  $("trim-edited").hidden = !(row && row.clip_edited === "yes");
+  $("trim-revert").disabled = !(row && row.clip_edited === "yes");
   $("fields").hidden = item.kind === "unlisted";
   $("btn-context").disabled = !state.ds.raw_audio || !row || row.start_sec === "";
 
@@ -278,18 +303,23 @@ async function select(clip) {
   document.querySelector("#clip-list li.active")?.scrollIntoView({ block: "nearest" });
   renderPanel();
 
+  loadClipAudio(clip);
+  if ($("autoplay").checked) audio.play().catch(() => {});
+  loadSegment();
+}
+
+function loadClipAudio(clip) {
   const token = ++state.loadToken;
   peaks = null;
   drawWave();
-  audio.src = audioUrl("clips", clip);
+  audio.src = clipUrl(clip);
   audio.playbackRate = parseFloat($("speed").value);
-  if ($("autoplay").checked) audio.play().catch(() => {});
   loadPeaks(clip, token);
 }
 
 async function loadPeaks(clip, token) {
   try {
-    const buf = await (await fetch(audioUrl("clips", clip))).arrayBuffer();
+    const buf = await (await fetch(clipUrl(clip))).arrayBuffer();
     audioCtx = audioCtx || new AudioContext();
     const decoded = await audioCtx.decodeAudioData(buf);
     if (token !== state.loadToken) return;
@@ -368,7 +398,229 @@ function playContext() {
 function stopAll() {
   audio.pause();
   rawAudio.pause();
+  stopTrim();
 }
+
+// ------------------------------------------------------------------ trim / extend
+
+const trimCanvas = $("trim-wave");
+
+async function loadSegment() {
+  const item = currentItem();
+  const token = ++trim.token;
+  stopTrim();
+  trim.buf = trim.peaks = trim.info = null;
+  if (!item || item.kind !== "row" || !$("trim").open) return drawTrim();
+
+  $("trim-hint").textContent = "Loading…";
+  drawTrim();
+  try {
+    const q = new URLSearchParams({ id: state.ds.id, clip: item.clip, v: Date.now() });
+    const res = await fetch(`/api/segment?${q}`);
+    if (!res.ok) throw new Error((await res.json()).error);
+    const info = JSON.parse(res.headers.get("X-Segment-Info"));
+    const data = await res.arrayBuffer();
+    audioCtx = audioCtx || new AudioContext();
+    const buf = await audioCtx.decodeAudioData(data);
+    if (token !== trim.token) return;
+
+    trim.buf = buf;
+    trim.info = info;
+    trim.sel = [info.sel_start, info.sel_end];
+    trim.peaks = computePeaks(buf.getChannelData(0), trimCanvas.clientWidth || 800);
+    $("trim-hint").textContent = info.mode === "raw"
+      ? `Showing the raw recording with ${(info.sel_start - info.segment_start).toFixed(1)}s of context before the clip. ` +
+        "Drag the handles (or type times on the raw timeline) to trim or extend, then save."
+      : "No raw audio timing for this clip, so it can only be trimmed. Times are relative to the clip.";
+    updateTrimInputs();
+  } catch (e) {
+    if (token === trim.token) $("trim-hint").textContent = `Could not load segment: ${e.message}`;
+  }
+}
+
+function segBounds() {
+  const s = trim.info.segment_start;
+  return [s, s + trim.buf.duration];
+}
+
+function timeToX(t) {
+  const [a, b] = segBounds();
+  return ((t - a) / (b - a)) * trimCanvas.clientWidth;
+}
+
+function xToTime(x) {
+  const [a, b] = segBounds();
+  return a + (x / trimCanvas.clientWidth) * (b - a);
+}
+
+function setHandle(which, t) {
+  const [a, b] = segBounds();
+  if (which === 0) trim.sel[0] = Math.min(Math.max(a, t), trim.sel[1] - MIN_CLIP_SEC);
+  else trim.sel[1] = Math.max(Math.min(b, t), trim.sel[0] + MIN_CLIP_SEC);
+  updateTrimInputs();
+}
+
+function updateTrimInputs() {
+  const [s, e] = trim.sel;
+  $("trim-start").value = s.toFixed(2);
+  $("trim-end").value = e.toFixed(2);
+  const was = trim.info.sel_end - trim.info.sel_start;
+  const ds = s - trim.info.sel_start, de = e - trim.info.sel_end;
+  const fmt = (v) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}s`;
+  const changed = Math.abs(ds) >= 0.005 || Math.abs(de) >= 0.005;
+  $("trim-len").textContent = `length ${(e - s).toFixed(2)}s (was ${was.toFixed(2)}s)` +
+    (changed ? ` · start ${fmt(ds)} · end ${fmt(de)}` : "");
+  $("trim-save").disabled = !changed;
+  drawTrim();
+}
+
+function drawTrim() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = trimCanvas.clientWidth, h = trimCanvas.clientHeight;
+  trimCanvas.width = w * dpr;
+  trimCanvas.height = h * dpr;
+  const ctx = trimCanvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  if (!trim.peaks) {
+    ctx.fillStyle = css.getPropertyValue("--wave");
+    ctx.fillRect(0, h / 2 - 1, w, 2);
+    return;
+  }
+
+  const x0 = timeToX(trim.sel[0]), x1 = timeToX(trim.sel[1]);
+  ctx.fillStyle = css.getPropertyValue("--accent-soft");
+  ctx.fillRect(x0, 0, x1 - x0, h);
+
+  const step = w / trim.peaks.length;
+  for (let i = 0; i < trim.peaks.length; i++) {
+    const x = i * step;
+    const amp = Math.max(1, trim.peaks[i] * (h / 2 - 6));
+    ctx.fillStyle = css.getPropertyValue(x >= x0 && x <= x1 ? "--wave-played" : "--wave");
+    ctx.fillRect(x, h / 2 - amp, Math.max(1, step - 0.5), amp * 2);
+  }
+
+  // Original clip boundaries (dashed) so changes are visible.
+  ctx.strokeStyle = css.getPropertyValue("--muted");
+  ctx.setLineDash([4, 4]);
+  for (const t of [trim.info.sel_start, trim.info.sel_end]) {
+    const x = Math.round(timeToX(t)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Draggable handles.
+  ctx.fillStyle = css.getPropertyValue("--accent");
+  for (const x of [x0, x1]) {
+    ctx.fillRect(x - 1, 0, 2, h);
+    ctx.fillRect(x - 5, 0, 10, 12);
+    ctx.fillRect(x - 5, h - 12, 10, 12);
+  }
+
+  if (trim.source) {
+    const t = trim.playFrom + (audioCtx.currentTime - trim.playStart) * trim.rate;
+    ctx.fillStyle = css.getPropertyValue("--review");
+    ctx.fillRect(timeToX(t) - 1, 0, 2, h);
+  }
+}
+
+function playTrim() {
+  if (!trim.buf) return;
+  if (trim.source) return stopTrim();
+  audio.pause();
+  rawAudio.pause();
+  const [a] = segBounds();
+  const src = audioCtx.createBufferSource();
+  src.buffer = trim.buf;
+  trim.rate = src.playbackRate.value = parseFloat($("speed").value);
+  src.connect(audioCtx.destination);
+  audioCtx.resume();
+  src.start(0, trim.sel[0] - a, trim.sel[1] - trim.sel[0]);
+  src.onended = () => { if (trim.source === src) stopTrim(); };
+  trim.source = src;
+  trim.playStart = audioCtx.currentTime;
+  trim.playFrom = trim.sel[0];
+  $("trim-play").textContent = "■ Stop";
+  const loop = () => { if (trim.source === src) { drawTrim(); requestAnimationFrame(loop); } };
+  loop();
+}
+
+function stopTrim() {
+  if (!trim.source) return;
+  const src = trim.source;
+  trim.source = null;
+  try { src.stop(); } catch { /* already stopped */ }
+  $("trim-play").textContent = "▶ Play selection";
+  drawTrim();
+}
+
+async function saveTrim() {
+  const item = currentItem();
+  if (!item || !trim.info) return;
+  if (state.dirty && !(await saveFields())) return;
+  stopAll();
+  await applyClipChange("/api/crop", {
+    clip_filename: item.clip,
+    start_sec: trim.sel[0],
+    end_sec: trim.sel[1],
+  }, "Clip re-cut");
+}
+
+async function revertTrim() {
+  const item = currentItem();
+  if (!item || !confirm("Delete the re-cut clip and restore the original timings?")) return;
+  if (state.dirty && !(await saveFields())) return;
+  stopAll();
+  await applyClipChange("/api/revert_clip", { clip_filename: item.clip }, "Reverted to original clip");
+}
+
+async function applyClipChange(path, body, message) {
+  setSaveState("Saving…");
+  try {
+    const saved = await api(`${path}?id=${encodeURIComponent(state.ds.id)}`, body);
+    applySavedRow(saved);
+    state.clipVersion[saved.clip_filename] = (state.clipVersion[saved.clip_filename] || 0) + 1;
+    render();
+    renderPanel();
+    loadClipAudio(saved.clip_filename);
+    loadSegment();
+    setSaveState(message);
+  } catch (e) {
+    setSaveState(`Save failed: ${e.message}`, true);
+  }
+}
+
+trimCanvas.addEventListener("pointerdown", (e) => {
+  if (!trim.buf) return;
+  const x = e.clientX - trimCanvas.getBoundingClientRect().left;
+  const d0 = Math.abs(x - timeToX(trim.sel[0])), d1 = Math.abs(x - timeToX(trim.sel[1]));
+  // Grab the nearest handle; clicking elsewhere moves the nearest handle there.
+  trim.drag = d0 <= d1 ? 0 : 1;
+  if (Math.min(d0, d1) > HANDLE_GRAB_PX) setHandle(trim.drag, xToTime(x));
+  trimCanvas.setPointerCapture(e.pointerId);
+});
+trimCanvas.addEventListener("pointermove", (e) => {
+  if (trim.drag === null) return;
+  setHandle(trim.drag, xToTime(e.clientX - trimCanvas.getBoundingClientRect().left));
+});
+trimCanvas.addEventListener("pointerup", () => { trim.drag = null; });
+
+$("trim-start").onchange = (e) => { if (trim.buf) setHandle(0, parseFloat(e.target.value)); };
+$("trim-end").onchange = (e) => { if (trim.buf) setHandle(1, parseFloat(e.target.value)); };
+$("trim-play").onclick = playTrim;
+$("trim-reset").onclick = () => {
+  if (!trim.info) return;
+  trim.sel = [trim.info.sel_start, trim.info.sel_end];
+  updateTrimInputs();
+};
+$("trim-save").onclick = saveTrim;
+$("trim-revert").onclick = revertTrim;
+$("trim").addEventListener("toggle", () => {
+  store("trimOpen", $("trim").open ? "1" : "0");
+  loadSegment();
+});
+$("trim").open = recall("trimOpen") === "1";
 
 // ------------------------------------------------------------------ saving
 
@@ -510,6 +762,10 @@ canvas.addEventListener("click", (e) => {
 
 window.addEventListener("resize", () => {
   if (state.current) loadPeaks(state.current, state.loadToken);
+  if (trim.buf) {
+    trim.peaks = computePeaks(trim.buf.getChannelData(0), trimCanvas.clientWidth || 800);
+    drawTrim();
+  }
 });
 
 window.addEventListener("beforeunload", (e) => {
@@ -523,6 +779,11 @@ document.addEventListener("keydown", (e) => {
     const actions = {
       KeyP: togglePlay,
       KeyC: playContext,
+      KeyT: () => {
+        if ($("trim").hidden) return;
+        if (!$("trim").open) $("trim").open = true;
+        else playTrim();
+      },
       KeyA: () => decide("approved"),
       KeyF: () => decide("needs_review"),
       KeyR: () => decide("rejected"),

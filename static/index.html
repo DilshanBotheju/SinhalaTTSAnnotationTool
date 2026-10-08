@@ -64,6 +64,24 @@
           <audio id="raw-audio" preload="none"></audio>
         </div>
 
+        <details id="trim" class="trim">
+          <summary>✂ Trim / extend clip <span id="trim-edited" class="tag" hidden>edited</span></summary>
+          <p class="trim-hint" id="trim-hint"></p>
+          <canvas id="trim-wave" height="120"></canvas>
+          <div class="controls">
+            <label>Start <input type="number" id="trim-start" step="0.01" min="0"></label>
+            <label>End <input type="number" id="trim-end" step="0.01" min="0"></label>
+            <span class="time" id="trim-len"></span>
+          </div>
+          <div class="controls">
+            <button id="trim-play" title="Alt+T">▶ Play selection</button>
+            <button id="trim-reset" title="Put the handles back where the clip currently is">Reset handles</button>
+            <button id="trim-revert" title="Delete the re-cut clip and restore the original timings">Revert to original</button>
+            <span class="spacer"></span>
+            <button id="trim-save" class="primary">Save new clip</button>
+          </div>
+        </details>
+
         <div id="unlisted-box" class="unlisted-box" hidden>
           <p>This clip exists in <code>clips/</code> but has <b>no row in metadata.csv</b>.
              Listen to it, then add it to the metadata to transcribe it.</p>
@@ -100,6 +118,7 @@
           <table>
             <tr><td>Alt+P / Space</td><td>Play / pause clip (Space only outside text boxes)</td></tr>
             <tr><td>Alt+C</td><td>Play segment in raw-audio context</td></tr>
+            <tr><td>Alt+T</td><td>Open trim panel / play trim selection</td></tr>
             <tr><td>Alt+A, Ctrl+Enter</td><td>Approve &amp; next</td></tr>
             <tr><td>Alt+F</td><td>Needs review &amp; next</td></tr>
             <tr><td>Alt+R</td><td>Reject &amp; next</td></tr>

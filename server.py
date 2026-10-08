@@ -7,10 +7,12 @@ Any folder under DATA_DIR that contains a `metadata.csv` and a `clips/` folder
 is treated as a dataset. DATA_DIR is never modified: annotations are written to
 OUT_DIR/<dataset path>/metadata.csv, which starts as a copy of the original
 CSV and is read back on later runs so work continues where it left off.
+Re-cut (trimmed/extended) clips are written to OUT_DIR/<dataset path>/clips/.
 """
 
 import argparse
 import csv
+import io
 import json
 import mimetypes
 import os
@@ -34,8 +36,13 @@ RAW_DIR = "raw_audio"
 STATUS_COL = "annotation_status"
 NOTES_COL = "annotation_notes"
 TIME_COL = "annotated_at"
-ANNOTATION_COLS = [STATUS_COL, NOTES_COL, TIME_COL]
+EDITED_COL = "clip_edited"
+ANNOTATION_COLS = [STATUS_COL, NOTES_COL, TIME_COL, EDITED_COL]
 STATUSES = {"pending", "approved", "rejected", "needs_review"}
+
+# Clip boundary editing: context shown either side of a clip, and shortest allowed clip.
+SEGMENT_PAD_SEC = 3.0
+MIN_CLIP_SEC = 0.2
 
 # Only these columns may be edited from the UI.
 EDITABLE_COLS = {"transcript_sinhala", "transcript_romanized", NOTES_COL}
@@ -214,6 +221,175 @@ def add_row(ds_id, payload):
     return new
 
 
+# --------------------------------------------------------------------------- clip editing
+
+def check_name(name):
+    if not name or Path(name).name != name:
+        raise ValueError(f"invalid file name: {name}")
+    return name
+
+
+def edited_clip_path(folder, clip):
+    """Where a re-cut clip is saved (mirrors the dataset's clips/ folder under OUT_ROOT)."""
+    return OUT_ROOT / folder.relative_to(DATA_ROOT) / CLIPS_DIR / clip
+
+
+def clip_path(folder, clip):
+    """The clip to play: the re-cut version if one exists, otherwise the original."""
+    edited = edited_clip_path(folder, clip)
+    return edited if edited.is_file() else folder / CLIPS_DIR / clip
+
+
+def raw_wav(folder):
+    name = first_audio(folder / RAW_DIR)
+    return folder / RAW_DIR / name if name and name.lower().endswith(".wav") else None
+
+
+def to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def find_row(rows, clip):
+    row = next((r for r in rows if r["clip_filename"] == clip), None)
+    if row is None:
+        raise ValueError(f"clip not in metadata: {clip}")
+    return row
+
+
+def edit_source(folder, row):
+    """Pick what a clip is re-cut from.
+
+    "raw":  the raw recording, using start_sec/end_sec, so boundaries can move outwards too.
+    "clip": the clip file itself (no raw wav or no timings), so it can only be trimmed.
+    """
+    raw = raw_wav(folder)
+    if raw and to_float(row.get("start_sec")) is not None and to_float(row.get("end_sec")) is not None:
+        return "raw", raw
+    return "clip", clip_path(folder, row["clip_filename"])
+
+
+def read_wav_range(path, start_sec, end_sec):
+    """Return (params, frames, actual_start_sec, file_duration_sec) for a time range of a wav."""
+    with wave.open(str(path)) as w:
+        rate, total = w.getframerate(), w.getnframes()
+        a = round(max(0.0, min(total, start_sec * rate)))
+        b = max(a, round(min(total, end_sec * rate)))
+        w.setpos(a)
+        return w.getparams(), w.readframes(b - a), a / rate, total / rate
+
+
+def wav_bytes(params, frames):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(params.nchannels)
+        w.setsampwidth(params.sampwidth)
+        w.setframerate(params.framerate)
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
+def frames_duration(params, frames):
+    return len(frames) / (params.sampwidth * params.nchannels) / params.framerate
+
+
+def clip_segment(ds_id, clip):
+    """Audio for the boundary editor: the clip plus SEGMENT_PAD_SEC of context each side.
+
+    Returns (wav bytes, info) where info gives the editor its time axis:
+    times are on the raw-recording timeline in "raw" mode, or relative to the clip in "clip" mode.
+    """
+    folder = dataset_dir(ds_id)
+    _, rows = read_csv(folder)
+    row = find_row(rows, check_name(clip))
+    mode, source = edit_source(folder, row)
+    if mode == "raw":
+        sel_start, sel_end = to_float(row["start_sec"]), to_float(row["end_sec"])
+        params, frames, seg_start, total = read_wav_range(
+            source, sel_start - SEGMENT_PAD_SEC, sel_end + SEGMENT_PAD_SEC)
+    else:
+        params, frames, seg_start, total = read_wav_range(source, 0, float("inf"))
+        sel_start, sel_end = 0.0, total
+    info = {
+        "mode": mode,
+        "segment_start": seg_start,
+        "source_duration": total,
+        "sel_start": sel_start,
+        "sel_end": sel_end,
+    }
+    return wav_bytes(params, frames), info
+
+
+def crop_clip(ds_id, payload):
+    """Re-cut a clip to new boundaries and save it under OUT_ROOT; update its CSV row."""
+    clip = check_name(payload.get("clip_filename"))
+    start, end = to_float(payload.get("start_sec")), to_float(payload.get("end_sec"))
+    if start is None or end is None:
+        raise ValueError("start_sec and end_sec are required")
+    if end - start < MIN_CLIP_SEC:
+        raise ValueError(f"clip must be at least {MIN_CLIP_SEC}s long")
+
+    folder = dataset_dir(ds_id)
+    with write_lock:
+        columns, rows = read_csv(folder)
+        ensure_annotation_cols(columns, rows)
+        row = find_row(rows, clip)
+        mode, source = edit_source(folder, row)
+        params, frames, actual_start, total = read_wav_range(source, start, end)
+        if start < 0 or end > total + 0.01:
+            raise ValueError(f"boundaries must be within 0–{total:.2f}s")
+
+        duration = frames_duration(params, frames)
+        if mode == "raw":
+            row["start_sec"] = round(actual_start, 2)
+            row["end_sec"] = round(actual_start + duration, 2)
+        else:
+            # Trimming inside the clip: shift the recorded timings if there are any.
+            old_start = to_float(row.get("start_sec"))
+            if old_start is not None:
+                row["start_sec"] = round(old_start + actual_start, 2)
+                row["end_sec"] = round(old_start + actual_start + duration, 2)
+        if "duration_sec" in columns:
+            row["duration_sec"] = round(duration, 2)
+
+        target = edited_clip_path(folder, clip)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".wav.tmp")
+        tmp.write_bytes(wav_bytes(params, frames))
+        os.replace(tmp, target)
+
+        row[EDITED_COL] = "yes"
+        row[TIME_COL] = datetime.now().isoformat(timespec="seconds")
+        write_csv(folder, columns, rows)
+    return row
+
+
+def revert_clip(ds_id, payload):
+    """Drop a re-cut clip and restore the original timings from the dataset's metadata.csv."""
+    clip = check_name(payload.get("clip_filename"))
+    folder = dataset_dir(ds_id)
+    with write_lock:
+        columns, rows = read_csv(folder)
+        ensure_annotation_cols(columns, rows)
+        row = find_row(rows, clip)
+        edited_clip_path(folder, clip).unlink(missing_ok=True)
+
+        with open(folder / METADATA_NAME, encoding="utf-8-sig", newline="") as f:
+            original = next((r for r in csv.DictReader(f) if r["clip_filename"] == clip), None)
+        for col in ("start_sec", "end_sec", "duration_sec"):
+            if col in columns:
+                row[col] = original.get(col, "") if original else row[col]
+        if not original and "duration_sec" in columns:
+            row["duration_sec"] = wav_duration(folder / CLIPS_DIR / clip)
+
+        row[EDITED_COL] = ""
+        row[TIME_COL] = datetime.now().isoformat(timespec="seconds")
+        write_csv(folder, columns, rows)
+    return row
+
+
 # --------------------------------------------------------------------------- HTTP
 
 class Handler(SimpleHTTPRequestHandler):
@@ -248,7 +424,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(dataset_detail(query["id"][0]))
             if url.path == "/audio":
                 return self.serve_audio(query["id"][0], query["kind"][0], query["file"][0])
-        except (KeyError, ValueError) as e:
+            if url.path == "/api/segment":
+                return self.send_segment(query["id"][0], query["clip"][0])
+        except (KeyError, ValueError, wave.Error) as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         return super().do_GET()
 
@@ -262,15 +440,34 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(update_row(ds_id, payload))
             if url.path == "/api/add_row":
                 return self.send_json(add_row(ds_id, payload))
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            if url.path == "/api/crop":
+                return self.send_json(crop_clip(ds_id, payload))
+            if url.path == "/api/revert_clip":
+                return self.send_json(revert_clip(ds_id, payload))
+        except (KeyError, ValueError, wave.Error, json.JSONDecodeError) as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        except OSError as e:
+            # e.g. Windows refusing to replace/delete a clip that is still open elsewhere
+            return self.send_json({"error": f"file busy, try again: {e.strerror}"}, HTTPStatus.CONFLICT)
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def send_segment(self, ds_id, clip):
+        body, info = clip_segment(ds_id, clip)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Segment-Info", json.dumps(info))
+        self.end_headers()
+        self.wfile.write(body)
 
     def serve_audio(self, ds_id, kind, name):
         """Serve an audio file with HTTP Range support so the browser can seek."""
-        if kind not in (CLIPS_DIR, RAW_DIR) or Path(name).name != name:
+        if kind not in (CLIPS_DIR, RAW_DIR):
             raise ValueError("invalid audio path")
-        path = dataset_dir(ds_id) / kind / name
+        folder = dataset_dir(ds_id)
+        name = check_name(name)
+        path = clip_path(folder, name) if kind == CLIPS_DIR else folder / kind / name
         if not path.is_file():
             return self.send_json({"error": "audio not found"}, HTTPStatus.NOT_FOUND)
 
@@ -297,6 +494,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         self.send_header("Content-Type", mimetypes.guess_type(name)[0] or "application/octet-stream")
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-cache")  # clips can be re-cut
         self.send_header("Content-Length", str(end - start + 1))
         self.end_headers()
         try:

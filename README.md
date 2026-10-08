@@ -44,6 +44,8 @@ data/<anything>/<dataset>/metadata.csv         original, read only
 annotations/<anything>/<dataset>/metadata.csv  annotated copy
 ```
 
+Re-cut clips go to `annotations/<anything>/<dataset>/clips/` (see [Trimming and extending clips](#trimming-and-extending-clips)).
+
 The annotated copy is created on the first save and is loaded on later runs, so work continues where it left off. To start over, delete it. Neither `data/` nor `annotations/` is committed to git.
 
 The annotated CSV keeps every original column and adds:
@@ -53,8 +55,23 @@ The annotated CSV keeps every original column and adds:
 | `annotation_status` | `pending`, `approved`, `rejected`, `needs_review` |
 | `annotation_notes` | free text from the annotator |
 | `annotated_at` | timestamp of the last save for that row |
+| `clip_edited` | `yes` if the clip was re-cut with the trim tool |
 
-Only `transcript_sinhala`, `transcript_romanized` and `annotation_notes` can be edited in the tool; timing columns are read-only because the clip files themselves aren't changed.
+`transcript_sinhala`, `transcript_romanized` and `annotation_notes` are edited directly. `start_sec`, `end_sec` and `duration_sec` change only through the trim tool (below).
+
+## Trimming and extending clips
+
+Open **✂ Trim / extend clip** under the player (or press `Alt+T`). It shows the clip inside the raw recording with 3 s of context either side:
+
+- drag the handles, click to move the nearest handle, or type start/end times,
+- **Play selection** to check the new boundaries,
+- **Save new clip** to cut it.
+
+Saving cuts the new clip from `raw_audio/` (sample-exact) and writes it to `annotations/<dataset>/clips/<same filename>`. It also updates `start_sec`, `end_sec`, `duration_sec` and `clip_edited` in the annotated CSV. The original clip in `data/` is untouched, and **Revert to original** deletes the re-cut file and restores the original timings.
+
+If a row has no `start_sec`/`end_sec` (e.g. a clip added from **Not in CSV**) or there's no raw `.wav`, the clip can only be trimmed, not extended.
+
+When using the annotated dataset, take each clip from `annotations/<dataset>/clips/` when `clip_edited` is `yes`, otherwise from `data/<dataset>/clips/`.
 
 ## Annotating
 
@@ -78,6 +95,7 @@ Clips that exist in `clips/` but have no CSV row appear under **Not in CSV**. Us
 |---|---|
 | `Alt+P`, or `Space` outside text boxes | Play / pause |
 | `Alt+C` | Play in context |
+| `Alt+T` | Open trim panel / play trim selection |
 | `Alt+A`, `Ctrl+Enter` | Approve and go to next |
 | `Alt+F` | Needs review and go to next |
 | `Alt+R` | Reject and go to next |
