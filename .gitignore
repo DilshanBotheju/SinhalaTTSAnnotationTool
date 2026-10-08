@@ -1,0 +1,16 @@
+# Dataset audio + metadata are large and live outside version control
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Temp files from atomic CSV writes
+*.csv.tmp
