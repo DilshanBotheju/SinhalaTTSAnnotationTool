@@ -7,7 +7,10 @@ Any folder under DATA_DIR that contains a `metadata.csv` and a `clips/` folder
 is treated as a dataset. DATA_DIR is never modified: annotations are written to
 OUT_DIR/<dataset path>/metadata.csv, which starts as a copy of the original
 CSV and is read back on later runs so work continues where it left off.
-Re-cut (trimmed/extended) clips are written to OUT_DIR/<dataset path>/clips/.
+
+OUT_DIR/<dataset path>/clips/ holds the complete approved set: re-cut and
+created clips, plus a copy of every approved original clip. Alongside it,
+metadata_approved.csv lists only the approved rows.
 """
 
 import argparse
@@ -16,6 +19,7 @@ import io
 import json
 import mimetypes
 import os
+import shutil
 import string
 import threading
 import urllib.parse
@@ -30,6 +34,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
 METADATA_NAME = "metadata.csv"
+APPROVED_NAME = "metadata_approved.csv"
 CLIPS_DIR = "clips"
 RAW_DIR = "raw_audio"
 
@@ -93,16 +98,60 @@ def read_csv(folder):
         return list(reader.fieldnames or []), list(reader)
 
 
-def write_csv(folder, columns, rows):
-    """Atomically write the annotated CSV to OUT_ROOT; the dataset folder is never touched."""
-    target = output_csv(folder)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".csv.tmp")
+def write_rows(path, columns, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".csv.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns, lineterminator="\n", extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(tmp, target)
+    os.replace(tmp, path)
+
+
+def write_csv(folder, columns, rows):
+    """Atomically write the annotated CSV to OUT_ROOT; the dataset folder is never touched."""
+    write_rows(output_csv(folder), columns, rows)
+    sync_outputs(folder, columns, rows)
+
+
+def sync_outputs(folder, columns, rows):
+    """Keep OUT_ROOT a complete copy of the approved dataset.
+
+    Writes metadata_approved.csv, copies each approved original clip into the output
+    clips/ folder, and removes the plain copy again when a clip is no longer approved.
+    Re-cut/created clips (clip_edited set) exist only there, so they are never removed.
+    """
+    approved = [r for r in rows if r.get(STATUS_COL) == "approved"]
+    write_rows(output_csv(folder).with_name(APPROVED_NAME), columns, approved)
+
+    out_dir = edited_clips_dir(folder)
+    for row in rows:
+        if row.get(EDITED_COL):
+            continue
+        name = row["clip_filename"]
+        dest = out_dir / name
+        try:
+            if row.get(STATUS_COL) == "approved":
+                src = folder / CLIPS_DIR / name
+                if not dest.exists() and src.is_file():
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.with_suffix(dest.suffix + ".tmp")
+                    shutil.copyfile(src, tmp)
+                    os.replace(tmp, dest)
+            elif dest.exists():
+                dest.unlink()
+        except OSError:
+            pass  # file busy (e.g. still being streamed); the next save retries
+
+
+def sync_all_datasets():
+    """Bring existing annotation folders up to date (e.g. clips approved before copying existed)."""
+    for ds_id in find_datasets():
+        folder = dataset_dir(ds_id)
+        if output_csv(folder).is_file():
+            with write_lock:
+                columns, rows = read_csv(folder)
+                sync_outputs(folder, columns, rows)
 
 
 def ensure_annotation_cols(columns, rows):
@@ -629,6 +678,7 @@ def main():
     print(f"Found {len(datasets)} dataset(s):")
     for d in datasets:
         print(f"  - {d}")
+    sync_all_datasets()
 
     url = f"http://127.0.0.1:{args.port}/"
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
